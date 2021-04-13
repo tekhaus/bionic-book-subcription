@@ -1,0 +1,339 @@
+{% if event.topic == "shopify/orders/create" %}
+  {% if event.preview %}
+    {% capture order_json %}
+      {
+        "id": 1234567890,
+        "created_at": "2020-12-31T00:00:00+10:00",
+        "line_items": [
+          {
+            "variant": {
+              "metafields": {
+                "global": {
+                  "subscription_data": {
+                    "type": "prepaid",
+                    "frequency": "bi-monthly",
+                    "duration": 3,
+                    "intervals": "2,4"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    {% endcapture %}
+
+    {% assign order = order_json | parse_json %}
+  {% endif %}
+
+  {% assign subscription_data = order.line_items.first.variant.metafields.global.subscription_data %}
+
+  {% comment %}
+  -- check to see if this order contains any prepaid subscription metadata
+  {% endcomment %}
+
+  {% if subscription_data == blank %}
+    {% log message: "This order does not contain any prepaid subscription metadata on its first line item; skipping" %}
+  {% else %}
+    {% assign order_created_at = order.created_at | date: "%Y-%m-%d" %}
+    {% assign intervals = subscription_data.intervals | split: "," %}
+
+    {% assign interval_for_api = "" %}
+
+    {% for interval in intervals %}
+      {% capture interval_value %}+0-{{ interval }}-0{% endcapture %}
+      {% assign interval_for_api = interval_for_api | append: interval_value %}
+      {% unless forloop.last %}
+        {% assign interval_for_api = interval_for_api | append: "\r\n" %}
+      {% endunless %}
+    {% endfor %}
+
+    {% capture body_json %}
+      {
+        "method": "addCal",
+        "params": {
+          "ical": "101.1",
+          "itype": "date",
+          "ival": {{ order_created_at | json }},
+          "ival2": "{{ interval_for_api }}",
+          "oform": "yyyy-MM-dd"
+        }
+      }
+    {% endcapture %}
+
+    {% comment %}
+    -- addCal CC attribution - http://www.hutime.org/about/license.html
+    {% endcomment %}
+
+    {% action "http" %}
+      {
+        "method": "post",
+        "url": "http://ap.hutime.org/cal/",
+        "body": {{ body_json }}
+      }
+    {% endaction %}
+  {% endif %}
+
+{% elsif event.topic == "mechanic/actions/perform" %}
+  {% comment %}
+  -- get response from API call, and use calculated dates to create "subscription" draft orders
+  {% endcomment %}
+
+  {% if event.preview %}
+    {% capture event_json %}
+      {
+        "data": {
+          "type": "http",
+          "run": {
+            "ok": true,
+            "result": {
+              "status": 200,
+              "body": [
+                {
+                  "text": "2021-02-28"
+                },
+                {
+                  "text": "2021-04-30"
+                }
+              ]
+            }
+          }
+        },
+        "preview": true,
+        "parent": {
+          "data": {
+            "id": 1234567890
+          }
+        }
+      }
+    {% endcapture %}
+
+    {% assign event = event_json | parse_json %}
+    {% assign action = event.data %}
+  {% endif %}
+
+  {% assign subscription_dates = nil %}
+
+  {% if action.type == "http" and action.run.ok %}
+    {% if action.run.result.status != 200 or action.run.result.body == blank %}
+      {% assign error_message = "Calendar API returned an error or null data; draft orders for this subscription will need to be created manually for this order" %}
+      {% assign email_subject
+        = "Calendar API returned an error when processing order "
+        | append: order.name
+      %}
+      {% capture email_body %}
+        {{ error_message }}
+      {% endcapture %}
+
+      {% action "email" %}
+        {
+          "to": {{ options.notify_this_email_on_error | json }},
+          "subject": {{ email_subject | json }},
+          "body": {{ email_body | unindent | newline_to_br | json }},
+          "reply_to": {{ shop.customer_email | json }},
+          "from_display_name": {{ shop.name | json }}
+        }
+      {% endaction %}
+
+      {% error message: error_message %}
+    {% endif %}
+
+    {% assign subscription_dates = action.run.result.body | map: "text" %}
+    {% assign order = shop.orders[event.parent.data.id] %}
+
+    {% if event.preview %}
+      {% capture order_json %}
+        {
+          "id": 1234567890,
+          "created_at": "2020-12-31T00:00:00+10:00",
+          "customer": {
+            "id": 1234567890,
+            "email": "sample@example.com"
+          },
+          "name": "#1234-Preview",
+          "line_items": [
+            {
+              "variant": {
+                "metafields": {
+                  "global": {
+                    "subscription_data": {
+                      "type": "prepaid",
+                      "frequency": "bi-monthly",
+                      "duration": 3,
+                      "intervals": "2,4"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      {% endcapture %}
+
+      {% assign order = order_json | parse_json %}
+    {% endif %}
+
+    {% assign subscription_data = order.line_items.first.variant.metafields.global.subscription_data %}
+
+    {% assign line_item = order.line_items.first %}
+    {% assign subscription_data = line_item.variant.metafields.global.subscription_data %}
+    {% assign subscription_type = subscription_data.type | capitalize | append: " Subscription" %}
+    {% assign subscription_frequency = subscription_data.frequency | capitalize %}
+
+    {% action "echo"
+      subscription_data: subscription_data,
+      subscription_dates: subscription_dates
+    %}
+  {% endif  %}
+
+  {% comment %}
+  -- create draft orders for each future subscription date
+  {% endcomment %}
+
+  {% for subscription_date in subscription_dates %}
+    {% capture subscription_title %}
+      {{ subscription_type }} - Book {{ forloop.index | plus: 1 }} of {{ forloop.length | plus: 1 }} - {{ subscription_frequency }}
+    {% endcapture %}
+
+    {% action "shopify" %}
+      mutation {
+        draftOrderCreate(
+          input: {
+            lineItems: [
+              {
+                originalUnitPrice: "0.00"
+                title: {{ subscription_title | strip | json }}
+                quantity: 1
+              }
+            ]
+            customAttributes: [
+              {
+                key: "Customer ID"
+                value: {{ order.customer.id | append: "" | json }}
+              }
+              {
+                key: "Customer Email"
+                value: {{ order.customer.email | json }}
+              }
+              {
+                key: "Prepaid Subscription Order"
+                value: {{ order.name | json }}
+              }
+              {
+                key: "Subscription Date"
+                value: {{ subscription_date | json }}
+              }
+            ]
+            tags: {{ subscription_type | json }}
+          }
+        ) {
+          draftOrder {
+            id
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    {% endaction %}
+  {% endfor %}
+
+{% comment %}
+-- every day, check for any open draft orders that should be converted to orders
+{% endcomment %}
+
+{% elsif event.topic == "mechanic/scheduler/daily" %}
+  {% assign today = "now" | date: "%Y-%m-%d" %}
+
+  {% capture "query" %}
+    query {
+      draftOrders(
+        first: 250
+        query: "status:open"
+      ) {
+        edges {
+          node {
+            id
+            customAttributes {
+              key
+              value
+            }
+          }
+        }
+      }
+    }
+  {% endcapture %}
+
+  {% assign result =  query | shopify %}
+
+  {% if event.preview %}
+    {% capture result_json %}
+      {
+        "data": {
+          "draftOrders": {
+            "edges": [
+              {
+                "node": {
+                  "id": "gid://shopify/DraftOrder/1234567890",
+                  "customAttributes": [
+                    {
+                      "key": "Customer ID",
+                      "value": "1234567890"
+                    },
+                    {
+                      "key": "Customer Email",
+                      "value": "test@example.com"
+                    },
+                    {
+                      "key": "Prepaid Order",
+                      "value": "#1234"
+                    },
+                    {
+                      "key": "Subscription Date",
+                      "value": {{ today | json }}
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    {% endcapture %}
+
+    {% assign result = result_json | parse_json %}
+  {% endif %}
+
+  {% assign draft_orders = result.data.draftOrders.edges | map: "node" %}
+
+  {% for draft_order in draft_orders %}
+    {% assign subscription_date
+      = draft_order
+      | map: "customAttributes"
+      | where: "key", "Subscription Date"
+      | map: "value"
+      | first
+    %}
+
+    {% if subscription_date == today %}
+      {% action "shopify" %}
+        mutation {
+          draftOrderComplete(id: {{ draft_order.id | json }}) {
+            draftOrder {
+              id
+              order {
+                id
+                name
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      {% endaction %}
+    {% endif %}
+  {% endfor %}
+{% endif %}

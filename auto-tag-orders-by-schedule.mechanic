@@ -1,0 +1,77 @@
+{% if event.preview %}
+  {% assign order = hash %}
+  {% assign order["admin_graphql_api_id"] = "gid://shopify/Order/1234567890" %}
+  {% assign order["created_at"] = "2021-01-21" %}
+  {% assign order["customer"] = hash %}
+  {% assign order["customer"]["admin_graphql_api_id"] = "gid://shopify/Customer/1234567890" %}
+{% endif %}
+
+{% assign year_of_order = order.created_at | date: "%Y" %}
+{% assign month_of_order = order.created_at | date: "%m" %}
+{% assign day_of_order = order.created_at | date: "%e" | times: 1 %}
+{% assign weekday_of_order = order.created_at | date: "%w" %}
+
+{% assign first_weekday_of_month =
+  year_of_order |
+  append: "-" |
+  append: month_of_order |
+  append: "-" |
+  append: "01" |
+  date: "%a"
+%}
+
+{% case first_weekday_of_month %}
+  {% when "Sun" %}
+    {% assign first_wednesday = 4 %}
+  {% when "Mon" %}
+    {% assign first_wednesday = 3 %}
+  {% when "Tue" %}
+    {% assign first_wednesday = 2 %}
+  {% when "Wed" %}
+    {% assign first_wednesday = 1 %}
+  {% when "Thu" %}
+    {% assign first_wednesday = 7 %}
+  {% when "Fri" %}
+    {% assign first_wednesday = 6 %}
+  {% when "Sat" %}
+    {% assign first_wednesday = 5 %}
+{% endcase%}
+
+{% assign third_wednesday = first_wednesday | plus: 14 %}
+
+{% if day_of_order > first_wednesday and day_of_order <= third_wednesday %}
+  {% assign tag_to_apply = "Schedule 2" %}
+{% else %}
+  {% assign tag_to_apply = "Schedule 1" %}
+{% endif %}
+
+{% action "echo"
+  year_of_order: year_of_order,
+  month_of_order: month_of_order,
+  day_of_order: day_of_order,
+  weekday_of_order: weekday_of_order,
+  first_weekday_of_month: first_weekday_of_month,
+  first_wednesday: first_wednesday,
+  third_wednesday: third_wednesday,
+  tag_to_apply: tag_to_apply
+%}
+
+{% if order.customer != blank %}
+  {% assign customer_tags = order.customer.tags | split: ", " %}
+
+  {% unless customer_tags contains "Schedule 1" or customer_tags contains "Schedule 2"  %}
+    {% action "shopify" %}
+      mutation {
+        tagsAdd(
+          id: {{ order.customer.admin_graphql_api_id | json }}
+          tags: {{ tag_to_apply | json }}
+        ) {
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    {% endaction %}
+  {% endunless %}
+{% endif %}
