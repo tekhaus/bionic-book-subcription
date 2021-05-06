@@ -12,7 +12,6 @@
                   "subscription_data": {
                     "type": "prepaid",
                     "frequency": "bi-monthly",
-                    "duration": 3,
                     "intervals": "2,4"
                   }
                 }
@@ -159,7 +158,6 @@
                     "subscription_data": {
                       "type": "prepaid",
                       "frequency": "bi-monthly",
-                      "duration": 3,
                       "intervals": "2,4"
                     }
                   }
@@ -195,6 +193,10 @@
       {{ subscription_type }} - Book {{ forloop.index | plus: 1 }} of {{ forloop.length | plus: 1 }} - {{ subscription_frequency }}
     {% endcapture %}
 
+    {% capture tags %}
+      {{ subscription_type }},Email:{{ order.customer.email }}
+    {% endcapture %}
+
     {% action "shopify" %}
       mutation {
         draftOrderCreate(
@@ -224,7 +226,7 @@
                 value: {{ subscription_date | json }}
               }
             ]
-            tags: {{ subscription_type | json }}
+            tags: {{ tags | strip | split: "," | json }}
           }
         ) {
           draftOrder {
@@ -243,7 +245,7 @@
 -- every day, check for any open draft orders that should be converted to orders
 {% endcomment %}
 
-{% elsif event.topic == "mechanic/scheduler/daily" %}
+{% elsif event.topic == "mechanic/scheduler/daily" or event.topic == "mechanic/user/trigger" %}
   {% assign today = "now" | date: "%Y-%m-%d" %}
 
   {% capture "query" %}
