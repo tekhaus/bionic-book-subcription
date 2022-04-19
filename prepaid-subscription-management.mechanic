@@ -1,3 +1,6 @@
+{% assign overdue_subscriptions_alert_email = options.overdue_subscriptions_alert_email__required %}
+{% assign notify_this_email_on_error = options.notify_this_email_on_calendar_api_error %}
+
 {% if event.topic == "shopify/orders/create" %}
   {% if event.preview %}
     {% capture order_json %}
@@ -33,6 +36,7 @@
 
   {% if subscription_data == blank %}
     {% log message: "This order does not contain any prepaid subscription metadata on its first line item; skipping" %}
+
   {% else %}
     {% assign order_created_at = order.created_at | date: "%Y-%m-%d" %}
     {% assign intervals = subscription_data.intervals | split: "," %}
@@ -42,6 +46,7 @@
     {% for interval in intervals %}
       {% capture interval_value %}+0-{{ interval }}-0{% endcapture %}
       {% assign interval_for_api = interval_for_api | append: interval_value %}
+
       {% unless forloop.last %}
         {% assign interval_for_api = interval_for_api | append: "\r\n" %}
       {% endunless %}
@@ -108,6 +113,7 @@
     {% endcapture %}
 
     {% assign event = event_json | parse_json %}
+
     {% assign action = event.data %}
   {% endif %}
 
@@ -120,15 +126,12 @@
         = "Calendar API returned an error when processing order "
         | append: order.name
       %}
-      {% capture email_body %}
-        {{ error_message }}
-      {% endcapture %}
 
       {% action "email" %}
         {
-          "to": {{ options.notify_this_email_on_error | json }},
+          "to": {{ notify_this_email_on_error | json }},
           "subject": {{ email_subject | json }},
-          "body": {{ email_body | unindent | newline_to_br | json }},
+          "body": {{ error_message | json }},
           "reply_to": {{ shop.customer_email | json }},
           "from_display_name": {{ shop.name | json }}
         }
@@ -178,7 +181,7 @@
     {% assign subscription_type = subscription_data.type | capitalize | append: " Subscription" %}
     {% assign subscription_frequency = subscription_data.frequency | capitalize %}
 
-    {% action "echo"
+    {% log
       subscription_data: subscription_data,
       subscription_dates: subscription_dates
     %}
@@ -248,15 +251,24 @@
 {% elsif event.topic == "mechanic/scheduler/daily" or event.topic == "mechanic/user/trigger" %}
   {% assign today = "now" | date: "%Y-%m-%d" %}
 
-  {% capture "query" %}
-    query {
-      draftOrders(
-        first: 250
-        query: "status:open"
-      ) {
-        edges {
-          node {
+  {% assign cursor = nil %}
+  {% assign draft_orders = array %}
+
+  {% for n in (1..100) %}
+    {% capture query %}
+      query {
+        draftOrders(
+          first: 250
+          after: {{ cursor | json }}
+          query: "status:open"
+        ) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
             id
+            name
             customAttributes {
               key
               value
@@ -264,20 +276,19 @@
           }
         }
       }
-    }
-  {% endcapture %}
+    {% endcapture %}
 
-  {% assign result =  query | shopify %}
+    {% assign result = query | shopify %}
 
-  {% if event.preview %}
-    {% capture result_json %}
-      {
-        "data": {
-          "draftOrders": {
-            "edges": [
-              {
-                "node": {
+    {% if event.preview %}
+      {% capture result_json %}
+        {
+          "data": {
+            "draftOrders": {
+              "nodes": [
+                {
                   "id": "gid://shopify/DraftOrder/1234567890",
+                  "name": "#D-TEST",
                   "customAttributes": [
                     {
                       "key": "Customer ID",
@@ -297,17 +308,32 @@
                     }
                   ]
                 }
-              }
-            ]
+              ]
+            }
           }
         }
-      }
-    {% endcapture %}
+      {% endcapture %}
 
-    {% assign result = result_json | parse_json %}
-  {% endif %}
+      {% assign result = result_json | parse_json %}
+    {% endif %}
 
-  {% assign draft_orders = result.data.draftOrders.edges | map: "node" %}
+    {% assign draft_orders = draft_orders | concat: result.data.draftOrders.nodes %}
+
+    {% if result.data.draftOrders.pageInfo.hasNextPage %}
+      {% assign cursor = result.data.draftOrders.pageInfo.endCursor %}
+    {% else %}
+      {% break %}
+    {% endif %}
+  {% endfor %}
+
+  {% assign draft_order_names = draft_orders | map: "name" %}
+
+  {% log
+    open_draft_order_count: draft_orders.size,
+    open_draft_order_names: draft_order_names
+  %}
+
+  {% assign overdue_subscriptions = array %}
 
   {% for draft_order in draft_orders %}
     {% assign subscription_date
@@ -324,6 +350,11 @@
           draftOrderComplete(id: {{ draft_order.id | json }}) {
             draftOrder {
               id
+              name
+              customAttributes {
+                key
+                value
+              }
               order {
                 id
                 name
@@ -336,6 +367,51 @@
           }
         }
       {% endaction %}
+
+    {% elsif subscription_date < today %}
+      {% assign prepaid_subscription_order
+        = draft_order
+        | map: "customAttributes"
+        | where: "key", "Prepaid Subscription Order"
+        | map: "value"
+        | first
+      %}
+      {% assign customer_email
+        = draft_order
+        | map: "customAttributes"
+        | where: "key", "Customer Email"
+        | map: "value"
+        | first
+      %}
+
+      {% capture overdue_data %}
+        Prepaid subscription order: {{ prepaid_subscription_order }}
+        Customer email: {{ customer_email }}
+        Draft order: {{ draft_order.name }}
+        Subscription date: {{ subscription_date }}
+      {% endcapture %}
+
+      {% assign overdue_subscriptions = overdue_subscriptions | push: overdue_data %}
     {% endif %}
   {% endfor %}
+
+  {% if overdue_subscriptions != blank %}
+    {% log overdue_subscriptions_count: overdue_subscriptions.size %}
+
+    {% capture email_body %}
+      There are {{ overdue_subscriptions.size }} draft orders still open with a subscription date in the past.
+
+      {{ overdue_subscriptions | join: newline }}
+    {% endcapture %}
+
+    {% action "email" %}
+      {
+        "to": {{ overdue_subscriptions_alert_email | json }},
+        "subject": "ALERT: Open draft orders with overdue subscriptions",
+        "body": {{ email_body | newline_to_br | json }},
+        "reply_to": {{ shop.customer_email | json }},
+        "from_display_name": {{ shop.name | json }}
+      }
+    {% endaction %}
+  {% endif %}
 {% endif %}
